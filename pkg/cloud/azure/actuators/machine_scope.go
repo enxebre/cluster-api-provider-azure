@@ -20,6 +20,8 @@ import (
 	"context"
 	"fmt"
 
+	"k8s.io/apimachinery/pkg/api/equality"
+
 	"github.com/Azure/go-autorest/autorest"
 	"github.com/Azure/go-autorest/autorest/adal"
 	"github.com/Azure/go-autorest/autorest/azure"
@@ -70,7 +72,7 @@ func NewMachineScope(params MachineScopeParams) (*MachineScope, error) {
 		return nil, err
 	}
 
-	machineConfig, err := MachineConfigFromProviderSpec(params.Client, params.Machine.Spec.ProviderSpec)
+	machineConfig, err := MachineConfigFromProviderSpec(params.Machine.Spec.ProviderSpec)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to get machine config")
 	}
@@ -140,6 +142,8 @@ func (m *MachineScope) Location() string {
 }
 
 func (m *MachineScope) storeMachineSpec(machine *machinev1.Machine) (*machinev1.Machine, error) {
+	MachineConfigFromProviderSpec(m.Machine.Spec.ProviderSpec)
+
 	ext, err := v1beta1.EncodeMachineSpec(m.MachineConfig)
 	if err != nil {
 		return nil, err
@@ -160,26 +164,32 @@ func (m *MachineScope) storeMachineStatus(machine *machinev1.Machine) (*machinev
 	return m.MachineClient.UpdateStatus(machine)
 }
 
-// Persist the machine spec and machine status.
-func (m *MachineScope) Persist() error {
-	if m.MachineClient == nil {
-		return fmt.Errorf("machine client is empty")
+func (s *MachineScope) PersistIfNeeded(currentMachine *machinev1.Machine) error {
+	currentConfig, err := MachineConfigFromProviderSpec(s.Machine.Spec.ProviderSpec)
+	if err != nil {
+		return fmt.Errorf("failed to get machine config: %v", err)
 	}
 
-	latestMachine, err := m.storeMachineSpec(m.Machine)
-	if err != nil {
-		return fmt.Errorf("[machinescope] failed to update machine %q in namespace %q: %v", m.Machine.Name, m.Machine.Namespace, err)
+	modifiedMachine := s.Machine.DeepCopy()
+	if !equality.Semantic.DeepEqual(currentMachine, modifiedMachine) ||
+		!equality.Semantic.DeepEqual(currentConfig, s.MachineConfig) {
+		modifiedMachine, err = s.storeMachineSpec(modifiedMachine)
+		if err != nil {
+			return fmt.Errorf("[machinescope] failed to update machine %q in namespace %q: %v", s.Machine.Name, s.Machine.Namespace, err)
+		}
 	}
 
-	_, err = m.storeMachineStatus(latestMachine)
-	if err != nil {
-		return fmt.Errorf("[machinescope] failed to store provider status for machine %q in namespace %q: %v", m.Machine.Name, m.Machine.Namespace, err)
+	if !equality.Semantic.DeepEqual(currentMachine.Status, s.Machine.Status) {
+		_, err = s.storeMachineStatus(modifiedMachine)
+		if err != nil {
+			return fmt.Errorf("[machinescope] failed to store provider status for machine %q in namespace %q: %v", s.Machine.Name, s.Machine.Namespace, err)
+		}
 	}
 	return nil
 }
 
 // MachineConfigFromProviderSpec tries to decode the JSON-encoded spec, falling back on getting a MachineClass if the value is absent.
-func MachineConfigFromProviderSpec(clusterClient machineclient.MachineClassesGetter, providerConfig machinev1.ProviderSpec) (*v1beta1.AzureMachineProviderSpec, error) {
+func MachineConfigFromProviderSpec(providerConfig machinev1.ProviderSpec) (*v1beta1.AzureMachineProviderSpec, error) {
 	var config v1beta1.AzureMachineProviderSpec
 	if providerConfig.Value != nil {
 		klog.V(4).Info("Decoding ProviderConfig from Value")

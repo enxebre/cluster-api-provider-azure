@@ -19,14 +19,21 @@ package actuators
 import (
 	"testing"
 
+	"k8s.io/utils/pointer"
+
+	"k8s.io/apimachinery/pkg/api/equality"
+
 	"github.com/ghodss/yaml"
 	clusterv1 "github.com/openshift/cluster-api/pkg/apis/cluster/v1alpha1"
 	machinev1 "github.com/openshift/cluster-api/pkg/apis/machine/v1beta1"
 	"github.com/openshift/cluster-api/pkg/client/clientset_generated/clientset/fake"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	clienttesting "k8s.io/client-go/testing"
 	clusterproviderv1 "sigs.k8s.io/cluster-api-provider-azure/pkg/apis/azureprovider/v1alpha1"
+	"sigs.k8s.io/cluster-api-provider-azure/pkg/apis/azureprovider/v1beta1"
 	machineproviderv1 "sigs.k8s.io/cluster-api-provider-azure/pkg/apis/azureprovider/v1beta1"
 	controllerfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
@@ -168,5 +175,132 @@ func TestCredentialsSecretFailures(t *testing.T) {
 	credentialsSecret.Data["azure_resource_prefix"] = []byte("dummyValue")
 	if err := testCredentialFields(credentialsSecret); err != nil {
 		t.Errorf("Expected New credentials secrets to succeed but found : %v", err)
+	}
+}
+
+func TestStoreMachineSpec(t *testing.T) {
+	currentProviderStatus := &machineproviderv1.AzureMachineProviderStatus{}
+	rawExt, err := v1beta1.EncodeMachineStatus(currentProviderStatus)
+	if err != nil {
+		t.Fatalf("Unexpected error %v", err)
+	}
+	modifiedProviderStatus := currentProviderStatus.DeepCopy()
+	modifiedProviderStatus.VMID = pointer.StringPtr("modified")
+
+	currentStatus := &machinev1.MachineStatus{}
+	currentStatus.ProviderStatus = rawExt
+	modifiedStatus := currentStatus.DeepCopy()
+	modifiedStatus.NodeRef = &corev1.ObjectReference{
+		Kind: "modified",
+	}
+
+	currentMachine := newMachine(t)
+	currentMachine.Status = *currentStatus
+	modifiedMachine := currentMachine.DeepCopy()
+	modifiedMachine.Spec.ProviderID = pointer.StringPtr("modified")
+
+	testCases := []struct {
+		modifiedMachine        *machinev1.Machine
+		modifiedStatus         *machinev1.MachineStatus
+		modifiedProviderSpec   *machineproviderv1.AzureMachineProviderSpec
+		modifiedProviderStatus *machineproviderv1.AzureMachineProviderStatus
+		updateCount            int
+	}{
+		{
+			modifiedMachine: currentMachine.DeepCopy(),
+			modifiedStatus:  currentStatus,
+			modifiedProviderSpec: &machineproviderv1.AzureMachineProviderSpec{
+				VMSize: "modified",
+			},
+			modifiedProviderStatus: currentProviderStatus,
+			updateCount:            1,
+		},
+		{
+			modifiedMachine:        currentMachine.DeepCopy(),
+			modifiedStatus:         currentStatus,
+			modifiedProviderSpec:   &machineproviderv1.AzureMachineProviderSpec{},
+			modifiedProviderStatus: currentProviderStatus,
+			updateCount:            0,
+		},
+		{
+			modifiedMachine:        modifiedMachine,
+			modifiedProviderSpec:   &machineproviderv1.AzureMachineProviderSpec{},
+			modifiedStatus:         currentStatus,
+			modifiedProviderStatus: currentProviderStatus,
+			updateCount:            1,
+		},
+		{
+			modifiedMachine:        currentMachine.DeepCopy(),
+			modifiedProviderSpec:   &machineproviderv1.AzureMachineProviderSpec{},
+			modifiedStatus:         modifiedStatus,
+			modifiedProviderStatus: currentProviderStatus,
+			updateCount:            2,
+		},
+	}
+
+	for _, tc := range testCases {
+		// create fake scope and client
+		client := fake.NewSimpleClientset(currentMachine)
+		updateCount := 0
+		client.Fake.PrependReactor("*", "*", func(action clienttesting.Action) (handled bool, ret runtime.Object, err error) {
+			switch action.(type) {
+			case clienttesting.UpdateActionImpl:
+				updateCount++
+			}
+			return handled, ret, nil
+		})
+		params := MachineScopeParams{
+			AzureClients: AzureClients{},
+			Cluster:      nil,
+			CoreClient:   nil,
+			Machine:      tc.modifiedMachine,
+			Client:       client.MachineV1beta1(),
+		}
+		s, err := NewMachineScope(params)
+		if err != nil {
+			t.Fatalf("Unexpected error %v", err)
+		}
+
+		// mutate objects
+		s.Machine.Status = *tc.modifiedStatus
+		s.MachineConfig = tc.modifiedProviderSpec
+		s.MachineStatus = tc.modifiedProviderStatus
+		if err = s.PersistIfNeeded(currentMachine); err != nil {
+			t.Fatalf("Unexpected error %v", err)
+		}
+
+		gotMachine, err := client.MachineV1beta1().Machines(s.Machine.Namespace).Get(s.Machine.Name, v1.GetOptions{})
+		if err != nil {
+			t.Fatalf("Unexpected error %v", err)
+		}
+		gotConfig, err := MachineConfigFromProviderSpec(gotMachine.Spec.ProviderSpec)
+		if err != nil {
+			t.Fatalf("Unexpected error %v", err)
+		}
+		gotStatus, err := v1beta1.MachineStatusFromProviderStatus(gotMachine.Status.ProviderStatus)
+		if err != nil {
+			t.Fatalf("Unexpected error %v", err)
+		}
+
+		if !equality.Semantic.DeepEqual(gotConfig, tc.modifiedProviderSpec) {
+			t.Errorf("Expected: %v, got: %v", tc.modifiedProviderSpec, gotConfig)
+		}
+
+		if !equality.Semantic.DeepEqual(s.MachineStatus, gotStatus) {
+			t.Errorf("Expected: %+v, got: %+v", s.MachineStatus, gotStatus)
+		}
+
+		// if update was called we need to reset ProviderSpec.Value to compare machines
+		// otherwise the refreshed providerSpec serialized representation via RawExtension.Raw
+		// might make the comparison to return not equal.
+		gotMachine.Spec.ProviderSpec.Value = nil
+		s.Machine.Spec.ProviderSpec.Value = nil
+		if !equality.Semantic.DeepEqual(gotMachine, s.Machine) {
+			t.Errorf("Expected: %+v, got: %+v", s.Machine, gotMachine)
+		}
+
+		if updateCount != tc.updateCount {
+			t.Errorf("Expected: %v, got: %v", tc.updateCount, updateCount)
+		}
 	}
 }
