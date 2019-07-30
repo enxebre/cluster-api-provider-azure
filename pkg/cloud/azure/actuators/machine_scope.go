@@ -19,6 +19,7 @@ package actuators
 import (
 	"context"
 	"fmt"
+	"k8s.io/apimachinery/pkg/api/equality"
 
 	"github.com/Azure/go-autorest/autorest"
 	"github.com/Azure/go-autorest/autorest/adal"
@@ -28,7 +29,7 @@ import (
 	machineclient "github.com/openshift/cluster-api/pkg/client/clientset_generated/clientset/typed/machine/v1beta1"
 	"github.com/pkg/errors"
 	apicorev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/equality"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/klog"
@@ -141,13 +142,11 @@ func (m *MachineScope) Location() string {
 }
 
 func (s *MachineScope) storeMachine() (*machinev1.Machine, error) {
-	ext, err := v1beta1.EncodeMachineSpec(s.MachineConfig)
+	latestMachine, err := s.MachineClient.Update(s.Machine)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to update machine: %v", err)
 	}
-
-	s.Machine.Spec.ProviderSpec.Value = ext
-	return s.MachineClient.Update(s.Machine)
+	return latestMachine, nil
 }
 
 func (s *MachineScope) storeMachineStatus() (*machinev1.Machine, error) {
@@ -156,35 +155,73 @@ func (s *MachineScope) storeMachineStatus() (*machinev1.Machine, error) {
 		return nil, err
 	}
 
+	time := metav1.Now()
+	s.Machine.Status.LastUpdated = &time
 	s.Machine.Status.ProviderStatus = ext
-	return s.MachineClient.UpdateStatus(s.Machine)
+
+	latestMachine, _ := s.MachineClient.UpdateStatus(s.Machine)
+	if err != nil {
+		return nil, fmt.Errorf("failed to update machine: %v", err)
+	}
+
+	// Status triggers resource version
+	// machineConfig does not need to be mutated
+	// equal objects do not trigger rv
+	// serialised raw ext do have different encoding
+	// trackRV?
+
+	return latestMachine, nil
 }
 
-func (s *MachineScope) PersistIfNeeded(currentMachine *machinev1.Machine) error {
-	currentConfig, err := MachineConfigFromProviderSpec(currentMachine.Spec.ProviderSpec)
-	if err != nil {
-		return fmt.Errorf("failed to get machine config: %v", err)
-	}
-	currentProviderStatus, err := v1beta1.MachineStatusFromProviderStatus(currentMachine.Status.ProviderStatus)
+func (s *MachineScope) PersistIfNeeded(originalMachine *machinev1.Machine) error {
+	//currentConfig, err := MachineConfigFromProviderSpec(currentMachine.Spec.ProviderSpec)
+	//if err != nil {
+	//	return fmt.Errorf("failed to get machine config: %v", err)
+	//}
+	originalProviderStatus, err := v1beta1.MachineStatusFromProviderStatus(originalMachine.Status.ProviderStatus)
 	if err != nil {
 		return fmt.Errorf("failed to get machine providerStatus: %v", err)
 	}
 
 	// update machine if needed
-	if !equality.Semantic.DeepEqual(currentMachine, s.Machine) ||
-		!equality.Semantic.DeepEqual(currentConfig, s.MachineConfig) {
-		if _, err := s.storeMachine(); err != nil {
+	if !equality.Semantic.DeepEqual(originalMachine, s.Machine) {
+	//	!equality.Semantic.DeepEqual(currentConfig, s.MachineConfig) {
+		_, err := s.storeMachine();
+		if err != nil {
 			return fmt.Errorf("[machinescope] failed to update machine %q in namespace %q: %v", s.Machine.Name, s.Machine.Namespace, err)
 		}
+		//if err := s.setScopeValuesFromMachine(latestMachine); err != nil {
+		//	return fmt.Errorf("failed to set machine scope values: %v", err)
+		//}
 	}
 
 	// update status if needed
-	if !equality.Semantic.DeepEqual(currentMachine.Status, s.Machine.Status) ||
-		!equality.Semantic.DeepEqual(currentProviderStatus, s.MachineStatus) {
-		if _, err := s.storeMachineStatus(); err != nil {
+	if !equality.Semantic.DeepEqual(originalMachine.Status, s.Machine.Status) ||
+		!equality.Semantic.DeepEqual(originalProviderStatus, s.MachineStatus) {
+		_, err := s.storeMachineStatus();
+		if err != nil {
 			return fmt.Errorf("[machinescope] failed to store provider status for machine %q in namespace %q: %v", s.Machine.Name, s.Machine.Namespace, err)
 		}
+		//if err := s.setScopeValuesFromMachine(latestMachine); err != nil {
+		//	return fmt.Errorf("failed to set machine scope values: %v", err)
+		//}
 	}
+	return nil
+}
+
+func (s *MachineScope) setScopeValuesFromMachine(machine *machinev1.Machine) error {
+	config, err := MachineConfigFromProviderSpec(machine.Spec.ProviderSpec)
+	if err != nil {
+		return fmt.Errorf("failed to get machine config: %v", err)
+	}
+
+	providerStatus, err := v1beta1.MachineStatusFromProviderStatus(machine.Status.ProviderStatus)
+	if err != nil {
+		return fmt.Errorf("failed to get machine providerStatus: %v", err)
+	}
+	s.Machine = machine
+	s.MachineConfig = config
+	s.MachineStatus = providerStatus
 	return nil
 }
 
