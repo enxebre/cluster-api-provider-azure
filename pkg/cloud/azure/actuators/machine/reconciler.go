@@ -120,7 +120,7 @@ func (s *Reconciler) CreateMachine(ctx context.Context) error {
 	}
 
 	if err := s.createVirtualMachine(ctx, nicName); err != nil {
-		return errors.Wrapf(err, "failed to create vm %s ", s.scope.Machine.Name)
+		return err
 	}
 
 	if s.scope.MachineConfig.UserDataSecret == nil {
@@ -422,7 +422,7 @@ func (s *Reconciler) Delete(ctx context.Context) error {
 
 	// Getting a vm object does not work here so let's assume
 	// an instance is really being deleted
-	s.scope.Machine.Annotations[MachineInstanceStateAnnotationName] = string(v1beta1.VMStateDeleting)
+	//s.scope.Machine.Annotations[MachineInstanceStateAnnotationName] = string(v1beta1.VMStateDeleting)
 	s.scope.MachineStatus.VMState = &v1beta1.VMStateDeleting
 
 	err := s.virtualMachinesSvc.Delete(ctx, vmSpec)
@@ -655,7 +655,7 @@ func (s *Reconciler) createVirtualMachine(ctx context.Context, nicName string) e
 
 		err = s.virtualMachinesSvc.CreateOrUpdate(ctx, vmSpec)
 		if err != nil {
-			return errors.Wrapf(err, "failed to create or get machine")
+			return err
 		}
 	} else if err != nil {
 		return errors.Wrap(err, "failed to get vm")

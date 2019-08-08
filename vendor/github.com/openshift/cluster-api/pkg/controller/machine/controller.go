@@ -49,6 +49,11 @@ const (
 
 	// ExcludeNodeDrainingAnnotation annotation explicitly skips node draining if set
 	ExcludeNodeDrainingAnnotation = "machine.openshift.io/exclude-node-draining"
+	phaseFailed                   = "Failed"
+	phaseProvisioning             = "Provisioning"
+	phaseProvisioned              = "Provisioned"
+	phaseRunning                  = "Running"
+	phaseDeleting                 = "deleting"
 )
 
 var DefaultActuator Actuator
@@ -179,6 +184,10 @@ func (r *ReconcileMachine) Reconcile(request reconcile.Request) (reconcile.Resul
 	}
 
 	if !m.ObjectMeta.DeletionTimestamp.IsZero() {
+		if err := r.setPhase(m, phaseDeleting, ""); err != nil {
+			return reconcile.Result{}, err
+		}
+
 		// no-op if finalizer has been removed.
 		if !util.Contains(m.ObjectMeta.Finalizers, machinev1.MachineFinalizer) {
 			klog.Infof("Reconciling machine %q causes a no-op as there is no finalizer", name)
@@ -236,6 +245,15 @@ func (r *ReconcileMachine) Reconcile(request reconcile.Request) (reconcile.Resul
 
 	if exist {
 		klog.Infof("Reconciling machine %q triggers idempotent update", name)
+		if m.Status.NodeRef != nil {
+			if err := r.setPhase(m, phaseRunning, ""); err != nil {
+				return reconcile.Result{}, err
+			}
+		} else {
+			if err := r.setPhase(m, phaseProvisioned, ""); err != nil {
+				return reconcile.Result{}, err
+			}
+		}
 		if err := r.actuator.Update(ctx, cluster, m); err != nil {
 			klog.Errorf(`Error updating machine "%s/%s": %v`, m.Namespace, name, err)
 			return delayIfRequeueAfterError(err)
@@ -245,12 +263,52 @@ func (r *ReconcileMachine) Reconcile(request reconcile.Request) (reconcile.Resul
 
 	// Machine resource created. Machine does not yet exist.
 	klog.Infof("Reconciling machine object %v triggers idempotent create.", m.ObjectMeta.Name)
+	if m.Spec.ProviderID != nil && *m.Spec.ProviderID != "" {
+		klog.Warningf("Machine %q already has providerID. A machine can only create a single cloud instance. Setting failed=phase", name)
+
+		if err := r.setPhase(m, phaseFailed, "Cloud instance was deleted out of band. A new instance for this object is not allowed."); err != nil {
+			return reconcile.Result{}, err
+		}
+		return reconcile.Result{}, nil
+	}
+
+	if m.Status.Phase != nil && *m.Status.Phase == phaseFailed {
+		klog.Warningf("Machine %q is already failed, won't try to create", name)
+		return reconcile.Result{}, nil
+	}
+
+	if err := r.setPhase(m, phaseProvisioning, ""); err != nil {
+		return reconcile.Result{}, err
+	}
 	if err := r.actuator.Create(ctx, cluster, m); err != nil {
 		klog.Warningf("Failed to create machine %q: %v", name, err)
+		switch t := err.(type) {
+		case *controllerError.UnrecoverableError:
+			klog.Warningf("Unrecoverable error when creating machine machine %q: %v", name, t)
+			if err := r.setPhase(m, phaseFailed, t.Error()); err != nil {
+				return reconcile.Result{}, err
+			}
+			return reconcile.Result{}, nil
+		}
 		return delayIfRequeueAfterError(err)
 	}
 
 	return reconcile.Result{}, nil
+}
+
+func (r *ReconcileMachine) setPhase(machine *machinev1.Machine, phase string, errorMessage string) error {
+	if machine.Status.Phase == nil || *machine.Status.Phase != phase {
+		klog.V(3).Infof("Machine %q going into phase %q", machine.GetName(), phase)
+		machine.Status.Phase = &phase
+		if phase == phaseFailed && errorMessage != "" {
+			machine.Status.ErrorMessage = &errorMessage
+		}
+		if err := r.Client.Status().Update(context.Background(), machine); err != nil {
+			klog.Errorf("Failed to update machine %q: %v", machine.GetName(), err)
+			return err
+		}
+	}
+	return nil
 }
 
 func (r *ReconcileMachine) drainNode(machine *machinev1.Machine) error {

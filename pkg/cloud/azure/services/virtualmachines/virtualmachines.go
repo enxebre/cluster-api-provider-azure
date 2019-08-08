@@ -26,6 +26,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/services/compute/mgmt/2018-10-01/compute"
 	"github.com/Azure/azure-sdk-for-go/services/network/mgmt/2018-12-01/network"
 	"github.com/Azure/go-autorest/autorest/to"
+	controllerError "github.com/openshift/cluster-api/pkg/controller/error"
 	"github.com/pkg/errors"
 	"golang.org/x/crypto/ssh"
 	"k8s.io/klog"
@@ -188,7 +189,10 @@ func (s *Service) CreateOrUpdate(ctx context.Context, spec azure.Spec) error {
 		vmSpec.Name,
 		virtualMachine)
 	if err != nil {
-		return errors.Wrapf(err, "cannot create vm")
+		klog.Errorf("cannot create vm: %v", err)
+		return &controllerError.UnrecoverableError{
+			Message: err.Error(),
+		}
 	}
 
 	// Do not wait until the operation completes. Just check the result

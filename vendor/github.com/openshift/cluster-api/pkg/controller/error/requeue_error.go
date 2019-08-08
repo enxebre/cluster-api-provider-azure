@@ -32,3 +32,15 @@ type RequeueAfterError struct {
 func (e *RequeueAfterError) Error() string {
 	return fmt.Sprintf("requeue in: %s", e.RequeueAfter)
 }
+
+// unrecoverableError represents that an actuator managed object should be
+// requeued for further processing after the given RequeueAfter time has
+// passed.
+type UnrecoverableError struct {
+	Message string
+}
+
+// Error implements the error interface
+func (e *UnrecoverableError) Error() string {
+	return fmt.Sprintf("unrecoverable error: %v", e.Message)
+}

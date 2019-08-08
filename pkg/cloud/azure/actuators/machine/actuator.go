@@ -109,6 +109,10 @@ func (a *Actuator) Create(ctx context.Context, cluster *clusterv1.Cluster, machi
 			klog.Errorf("Error storing machine info: %v", err)
 		}
 		a.handleMachineError(machine, apierrors.CreateMachine("failed to reconcile machine %qs: %v", machine.Name, err), createEventAction)
+		switch t := err.(type) {
+		case *controllerError.UnrecoverableError:
+			return t
+		}
 		return &controllerError.RequeueAfterError{
 			RequeueAfter: time.Minute,
 		}
